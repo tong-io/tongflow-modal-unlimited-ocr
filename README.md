@@ -1,3 +1,6 @@
+<img width="1582" height="977" alt="截屏2026-06-22 21 48 19" src="https://github.com/user-attachments/assets/4cb8c45b-4dfa-49be-a134-af5a84f7dfde" />
+
+
 # tongflow-modal-unlimited-ocr
 
 Official [TongFlow](https://github.com/tong-io/tongflow) plugin. Document-to-text (OCR / long-horizon document parsing) with Baidu's **Unlimited-OCR** (`baidu/Unlimited-OCR`), running on a GPU via [Modal](https://modal.com). An alternative to `tongflow-modal-docling` and `tongflow-modal-paddle` on the same `parse-document` slot.
