@@ -19,3 +19,24 @@ Add in TongFlow **Settings** (gear icon, top-right):
 | `MODAL_TOKEN_SECRET` | ✅ | Paired with `MODAL_TOKEN_ID`. |
 
 On first use the plugin downloads the `baidu/Unlimited-OCR` weights to a Modal Volume, deploys to your Modal account automatically, and caches the build. The weights are public — no Hugging Face token required.
+
+## Acknowledgements
+
+This plugin is a thin TongFlow wrapper around Baidu's **Unlimited-OCR** model. All credit for the model goes to the Unlimited-OCR team. The weights are released under the MIT License.
+
+- Model: [baidu/Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR) (Hugging Face)
+- Source: [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR) (GitHub)
+
+## Citation
+
+If you use this plugin, please cite the upstream Unlimited-OCR work. A formal
+citation is forthcoming from the authors (see the [upstream repo](https://github.com/baidu/Unlimited-OCR#citation)); until then, reference it as:
+
+```bibtex
+@misc{unlimitedocr2026,
+  title  = {Unlimited OCR Works},
+  author = {Baidu},
+  year   = {2026},
+  howpublished = {\url{https://github.com/baidu/Unlimited-OCR}}
+}
+```
