@@ -1,4 +1,9 @@
 {
+    "plugin": {
+        "name": "Unlimited-OCR",
+        "description": "Long-horizon document parsing / OCR with Baidu Unlimited-OCR — image or PDF pages into Markdown.",
+        "icon": "/plugins/tongflow-modal-unlimited-ocr.svg"
+    },
     "env": [
         {
             "key": "MODAL_TOKEN_ID",
