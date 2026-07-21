@@ -48,7 +48,7 @@ volume = modal.Volume.from_name("models", create_if_missing=True)
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel")
     .pip_install(
-        "tongflow==0.1.0",
+        "tongflow==0.2.13", "fastapi[standard]",
         # transformers pulls a compatible huggingface_hub (<1.0) and tokenizers;
         # do not pin those here or they conflict with transformers' own ranges.
         "transformers==4.57.1",
@@ -171,3 +171,18 @@ class Inference:
         except Exception as e:
             logger.error(f"unlimited-ocr inference error: {e}", exc_info=True)
             return ParseDocumentOutput(success=False, error=f"infer error: {e}")
+
+    @modal.fastapi_endpoint(method="GET", label=f"{Path(__file__).resolve().parent.name}-serve")
+    def serve(self, taskId: str = "", token: str = "", origin: str = ""):
+        from fastapi.responses import StreamingResponse
+        from tongflow import serve_stream_from_spec
+
+        return StreamingResponse(
+            serve_stream_from_spec(
+                origin, taskId, token, __file__,
+                invoke=lambda m, inp: getattr(self, m).local(inp),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+        )
+
