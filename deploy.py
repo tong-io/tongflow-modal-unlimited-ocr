@@ -10,6 +10,7 @@ Deploy:
 from __future__ import annotations
 
 import logging
+import math
 import tempfile
 from pathlib import Path
 
@@ -40,6 +41,15 @@ SINGLE_NGRAM_WINDOW = 128
 # base config (multi-page / PDF): no cropping, larger ngram window.
 MULTI_IMAGE_SIZE = 1024
 MULTI_NGRAM_WINDOW = 1024
+# HF `generate` treats `max_length` as input + output, and `infer_multi`
+# hardcodes it — so the page images must fit alongside the generated text.
+# Each page emits a fixed count of image tokens at MULTI_IMAGE_SIZE
+# (num_queries = ceil((image_size // 16) / 4); tokens = (nq + 1) * nq + 1).
+# Chunk pages so each call's input stays under half the window, leaving the
+# other half for the OCR text. This is what makes long PDFs "unlimited".
+_MULTI_NUM_QUERIES = math.ceil((MULTI_IMAGE_SIZE // 16) / 4)
+TOKENS_PER_PAGE = (_MULTI_NUM_QUERIES + 1) * _MULTI_NUM_QUERIES + 1
+PAGES_PER_CHUNK = max(1, (MAX_LENGTH // 2) // TOKENS_PER_PAGE)
 SINGLE_PROMPT = "<image>document parsing."
 MULTI_PROMPT = "<image>Multi page parsing."
 
@@ -62,6 +72,9 @@ image = (
         "numpy",
         "tqdm",
     )
+    # expandable_segments reduces allocator fragmentation on the long
+    # prefill + KV cache of multi-page OCR.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
 )
 
 app = modal.App(Path(__file__).resolve().parent.name, image=image)
@@ -99,7 +112,7 @@ def is_pdf(path: str) -> bool:
 @deploy
 @app.cls(
     image=image,
-    gpu="A10G",
+    gpu="A100-80GB",
     volumes={"/models": volume},
     timeout=1800,
     secrets=[secrets],
@@ -139,18 +152,25 @@ class Inference:
         )
 
     def _parse_multi(self, image_paths: list[str], out_dir: str) -> str:
-        outputs, _tokens = self.model.infer_multi(
-            self.tokenizer,
-            prompt=MULTI_PROMPT,
-            image_files=image_paths,
-            output_path=out_dir,
-            image_size=MULTI_IMAGE_SIZE,
-            max_length=MAX_LENGTH,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-            ngram_window=MULTI_NGRAM_WINDOW,
-            save_results=False,
-        )
-        return outputs
+        # Split into page batches so a long PDF never exceeds `max_length`
+        # (input + output) on a single generate call. Chunk outputs are joined
+        # in page order; cross-chunk context is lost only at batch boundaries.
+        chunks: list[str] = []
+        for start in range(0, len(image_paths), PAGES_PER_CHUNK):
+            batch = image_paths[start : start + PAGES_PER_CHUNK]
+            outputs, _tokens = self.model.infer_multi(
+                self.tokenizer,
+                prompt=MULTI_PROMPT,
+                image_files=batch,
+                output_path=out_dir,
+                image_size=MULTI_IMAGE_SIZE,
+                max_length=MAX_LENGTH,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                ngram_window=MULTI_NGRAM_WINDOW,
+                save_results=False,
+            )
+            chunks.append(outputs or "")
+        return "\n\n".join(chunks)
 
     @modal.method()
     @node_slot(NodeSlots.PARSE_DOCUMENT)
