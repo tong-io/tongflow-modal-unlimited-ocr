@@ -58,7 +58,7 @@ volume = modal.Volume.from_name("models", create_if_missing=True)
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel")
     .pip_install(
-        "tongflow==0.2.20", "fastapi[standard]",
+        "tongflow==0.2.21", "fastapi[standard]",
         # transformers pulls a compatible huggingface_hub (<1.0) and tokenizers;
         # do not pin those here or they conflict with transformers' own ranges.
         "transformers==4.57.1",
