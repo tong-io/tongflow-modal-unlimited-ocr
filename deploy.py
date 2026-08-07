@@ -116,7 +116,7 @@ def is_pdf(path: str) -> bool:
     volumes={"/models": volume},
     timeout=1800,
     secrets=[secrets],
-    scaledown_window=30,
+    scaledown_window=2,
 )
 class Inference:
     @modal.enter()
