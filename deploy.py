@@ -20,7 +20,31 @@ from tongflow import deploy
 from tongflow.models.parse_document import ParseDocumentInput, ParseDocumentOutput
 from tongflow.node_slots import NodeSlots
 from tongflow.protocol import asset_as_path
-from tongflow.slots import node_slot
+from tongflow.slots import current_params, node_slot
+
+
+def _adv(name: str, default):
+    """Advanced-section override (``TONGFLOW_SLOT_PARAMS``) or the plugin default."""
+    v = current_params().get(name)
+    if v is None:
+        return default
+    if isinstance(default, bool):
+        return bool(v)
+    if isinstance(default, int):
+        return int(v)
+    if isinstance(default, float):
+        return float(v)
+    return v
+
+# Per-run knobs offered under the node's collapsed "Advanced" section.
+# Pure literal (the platform scanner reads it by AST, never imports this
+# module). Values reach the handlers via current_params(); an untouched
+# control is absent there and falls back to the plugin default.
+TONGFLOW_SLOT_PARAMS = {
+    "parse-document": {
+        "pdf_dpi": {"type": "select", "options": [150, 200, 300], "default": 300, "label": "PDF render DPI"},
+    },
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +82,7 @@ volume = modal.Volume.from_name("models", create_if_missing=True)
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel")
     .pip_install(
-        "tongflow==0.2.21", "fastapi[standard]",
+        "tongflow==0.3.3", "fastapi[standard]",
         # transformers pulls a compatible huggingface_hub (<1.0) and tokenizers;
         # do not pin those here or they conflict with transformers' own ranges.
         "transformers==4.57.1",
@@ -183,7 +207,7 @@ class Inference:
                 # infer()/infer_multi() always mkdir output_path, even when not saving.
                 out_dir = tempfile.mkdtemp(prefix="ocr_out_")
                 if is_pdf(doc_path):
-                    pages = pdf_to_images(doc_path, out_dir)
+                    pages = pdf_to_images(doc_path, out_dir, dpi=_adv("pdf_dpi", PDF_DPI))
                     text = self._parse_multi(pages, out_dir)
                 else:
                     text = self._parse_single(doc_path, out_dir)
