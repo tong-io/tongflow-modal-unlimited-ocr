@@ -12,7 +12,7 @@ import os
 
 import modal
 
-REPO_ID = "baidu/Unlimited-OCR"
+REPO_ID = "baidu/Unlimited-OCR-2"
 MODEL_DIR = f"/models/{REPO_ID}"
 
 volume = modal.Volume.from_name("models", create_if_missing=True)

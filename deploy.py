@@ -1,7 +1,7 @@
 """Modal deploy entry for unlimited-ocr.
 
-Document-to-text (OCR / long-horizon document parsing) with Baidu's
-``baidu/Unlimited-OCR`` model, running on a GPU.
+Document-to-text (OCR / unlimited-horizon document parsing) with Baidu's
+``baidu/Unlimited-OCR-2`` model, running on a GPU.
 
 Deploy:
   modal deploy deploy.py
@@ -10,7 +10,7 @@ Deploy:
 from __future__ import annotations
 
 import logging
-import math
+import re
 import tempfile
 from pathlib import Path
 
@@ -53,45 +53,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Plugin-internal config; not exposed via ABI.
-REPO_ID = "baidu/Unlimited-OCR"
+REPO_ID = "baidu/Unlimited-OCR-2"
 MODEL_DIR = f"/models/{REPO_ID}"
 PDF_DPI = 300
-MAX_LENGTH = 32768
+# Total sequence (page image tokens + generated text) per `infer` call; the
+# model's own default and its max_position_embeddings.
+MAX_LENGTH = 131072
 NO_REPEAT_NGRAM_SIZE = 35
-# gundam config (single image): high-detail crop tiling.
-SINGLE_BASE_SIZE = 1024
-SINGLE_IMAGE_SIZE = 640
+# Upstream evaluation setup: a narrow n-gram window for one page, a wide one
+# for multi-page documents.
 SINGLE_NGRAM_WINDOW = 128
-# base config (multi-page / PDF): no cropping, larger ngram window.
-MULTI_IMAGE_SIZE = 1024
 MULTI_NGRAM_WINDOW = 1024
-# HF `generate` treats `max_length` as input + output, and `infer_multi`
-# hardcodes it — so the page images must fit alongside the generated text.
-# Each page emits a fixed count of image tokens at MULTI_IMAGE_SIZE
-# (num_queries = ceil((image_size // 16) / 4); tokens = (nq + 1) * nq + 1).
-# Chunk pages so each call's input stays under half the window, leaving the
-# other half for the OCR text. This is what makes long PDFs "unlimited".
-_MULTI_NUM_QUERIES = math.ceil((MULTI_IMAGE_SIZE // 16) / 4)
-TOKENS_PER_PAGE = (_MULTI_NUM_QUERIES + 1) * _MULTI_NUM_QUERIES + 1
-PAGES_PER_CHUNK = max(1, (MAX_LENGTH // 2) // TOKENS_PER_PAGE)
-SINGLE_PROMPT = "<image>document parsing."
-MULTI_PROMPT = "<image>Multi page parsing."
+# SR-SWA keeps per-step decode cost flat, but the Transformers path still caps
+# one call at MAX_LENGTH tokens. A page costs ~273 image tokens (base mode,
+# 1024px) plus its text, so ~48 pages leave ~2.4k output tokens per page.
+# Longer PDFs are parsed in page windows of this size, joined in order.
+PAGES_PER_CALL = 48
+
+# Grounding markup the model interleaves with the Markdown:
+# <|ref|>label<|/ref|><|det|>[[x1, y1, x2, y2]]<|/det|>
+_REF_DET = re.compile(r"<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>", re.DOTALL)
+_BARE_DET = re.compile(r"<\|det\|>\s*[A-Za-z_][\w-]*\s*\[[^\]]+\]\s*<\|/det\|>", re.DOTALL)
+PAGE_MARKER = "<PAGE>"
 
 volume = modal.Volume.from_name("models", create_if_missing=True)
 
 image = (
-    modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel")
+    # devel image: the model's Triton sparse-attention kernels need a C compiler.
+    modal.Image.from_registry(
+        "nvidia/cuda:12.6.3-devel-ubuntu22.04", add_python="3.12"
+    )
     .pip_install(
-        "tongflow==0.3.3", "fastapi[standard]",
-        # transformers pulls a compatible huggingface_hub (<1.0) and tokenizers;
-        # do not pin those here or they conflict with transformers' own ranges.
-        "transformers==4.57.1",
+        "torch==2.13.0",
+        "torchvision==0.28.0",
+        extra_index_url="https://download.pytorch.org/whl/cu126",
+    )
+    .pip_install(
+        "tongflow==0.3.4", "fastapi[standard]",
+        # Upstream-tested stack for the remote modeling code.
+        "transformers==4.52.1",
+        "tokenizers==0.21.4",
+        "huggingface-hub==0.36.0",
         "einops==0.8.2",
         "addict==2.4.0",
         "easydict==1.13",
         "pymupdf==1.27.2.2",
-        "matplotlib==3.10.8",
-        "psutil==7.2.2",
+        "requests",
         "pillow",
         "numpy",
         "tqdm",
@@ -133,12 +140,23 @@ def is_pdf(path: str) -> bool:
         return False
 
 
+def clean_pages(raw: str) -> list[str]:
+    """Split raw model output on <PAGE> and drop grounding markup (as upstream's result.md)."""
+    pages = raw.split(PAGE_MARKER)[1:] if PAGE_MARKER in raw else [raw]
+    out: list[str] = []
+    for page in pages:
+        page = _BARE_DET.sub("", _REF_DET.sub("", page))
+        page = page.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
+        out.append(page.strip())
+    return out
+
+
 @deploy
 @app.cls(
     image=image,
     gpu="A100-80GB",
     volumes={"/models": volume},
-    timeout=1800,
+    timeout=3600,
     secrets=[secrets],
     scaledown_window=2,
 )
@@ -160,41 +178,25 @@ class Inference:
             .cuda()
         )
 
-    def _parse_single(self, image_path: str, out_dir: str) -> str:
-        return self.model.infer(
-            self.tokenizer,
-            prompt=SINGLE_PROMPT,
-            image_file=image_path,
-            output_path=out_dir,
-            base_size=SINGLE_BASE_SIZE,
-            image_size=SINGLE_IMAGE_SIZE,
-            crop_mode=True,
-            max_length=MAX_LENGTH,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-            ngram_window=SINGLE_NGRAM_WINDOW,
-            eval_mode=True,
-        )
-
-    def _parse_multi(self, image_paths: list[str], out_dir: str) -> str:
-        # Split into page batches so a long PDF never exceeds `max_length`
-        # (input + output) on a single generate call. Chunk outputs are joined
-        # in page order; cross-chunk context is lost only at batch boundaries.
-        chunks: list[str] = []
-        for start in range(0, len(image_paths), PAGES_PER_CHUNK):
-            batch = image_paths[start : start + PAGES_PER_CHUNK]
-            outputs, _tokens = self.model.infer_multi(
+    def _parse(self, image_paths: list[str], out_dir: str) -> str:
+        # No prompt: the model builds its trained "<PAGE><image>" * n +
+        # "Multi page parsing." layout, and crop_mode=None picks gundam tiling
+        # for a single page and base mode for several.
+        ngram_window = SINGLE_NGRAM_WINDOW if len(image_paths) == 1 else MULTI_NGRAM_WINDOW
+        pages: list[str] = []
+        for start in range(0, len(image_paths), PAGES_PER_CALL):
+            batch = image_paths[start : start + PAGES_PER_CALL]
+            raw = self.model.infer(
                 self.tokenizer,
-                prompt=MULTI_PROMPT,
-                image_files=batch,
+                image_file=batch,
                 output_path=out_dir,
-                image_size=MULTI_IMAGE_SIZE,
                 max_length=MAX_LENGTH,
                 no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-                ngram_window=MULTI_NGRAM_WINDOW,
-                save_results=False,
+                ngram_window=ngram_window,
+                eval_mode=True,
             )
-            chunks.append(outputs or "")
-        return "\n\n".join(chunks)
+            pages.extend(clean_pages(raw or ""))
+        return "\n\n".join(p for p in pages if p)
 
     @modal.method()
     @node_slot(NodeSlots.PARSE_DOCUMENT)
@@ -204,14 +206,13 @@ class Inference:
         try:
             with asset_as_path(input.document, suffix=".bin") as doc_path:
                 doc_path = str(doc_path)
-                # infer()/infer_multi() always mkdir output_path, even when not saving.
                 out_dir = tempfile.mkdtemp(prefix="ocr_out_")
                 if is_pdf(doc_path):
                     pages = pdf_to_images(doc_path, out_dir, dpi=_adv("pdf_dpi", PDF_DPI))
-                    text = self._parse_multi(pages, out_dir)
                 else:
-                    text = self._parse_single(doc_path, out_dir)
-            return ParseDocumentOutput(success=True, text=text or "")
+                    pages = [doc_path]
+                text = self._parse(pages, out_dir)
+            return ParseDocumentOutput(success=True, text=text)
         except Exception as e:
             logger.error(f"unlimited-ocr inference error: {e}", exc_info=True)
             return ParseDocumentOutput(success=False, error=f"infer error: {e}")
@@ -229,4 +230,3 @@ class Inference:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
         )
-

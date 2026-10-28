@@ -1,7 +1,7 @@
 {
     "plugin": {
-        "name": "Unlimited-OCR",
-        "description": "Long-horizon document parsing / OCR with Baidu Unlimited-OCR — image or PDF pages into Markdown.",
+        "name": "Unlimited OCR 2",
+        "description": "Unlimited-horizon document parsing / OCR with Baidu Unlimited OCR 2 — images or hundred-page PDFs into Markdown in one pass.",
         "icon": "/plugins/tongflow-modal-unlimited-ocr.svg"
     },
     "env": [
@@ -18,7 +18,7 @@
         },
         {
             "key": "TONGFLOW_MODAL_CALL_TIMEOUT_S",
-            "default": "2400",
+            "default": "3600",
             "description": "Max seconds to wait for a Modal call"
         }
     ]
