@@ -7,7 +7,7 @@ Official [TongFlow](https://github.com/tong-io/tongflow) plugin. Document-to-tex
 
 ## Capabilities
 
-- **Document → text** (`parse-document`) — parse an image or a PDF into Markdown. Single images use the high-detail *gundam* config (cropped tiling); PDFs are rendered to page images and parsed together in *base* config, so the model keeps cross-page context (SR-SWA keeps per-step cost flat as documents grow). Very long PDFs are processed in windows of 48 pages.
+- **Document → text** (`parse-document`) — parse an image or a PDF into Markdown. Single images use the high-detail *gundam* config (cropped tiling); PDFs are rendered to page images and parsed together in *base* config, so the model keeps cross-page context (SR-SWA keeps per-step cost flat as documents grow). Very long PDFs are processed in windows of 48 pages. Figures the model detects are cropped from their page and returned on the node's **images** output; the Markdown marks where each sat as `![image N](#image-N)`, N being its position in that list.
 
 ## Credentials
 

@@ -9,6 +9,8 @@ Deploy:
 
 from __future__ import annotations
 
+import ast
+import io
 import logging
 import re
 import tempfile
@@ -17,9 +19,10 @@ from pathlib import Path
 import modal
 from tongflow import deploy
 
+from tongflow.models.asset import Asset
 from tongflow.models.parse_document import ParseDocumentInput, ParseDocumentOutput
 from tongflow.node_slots import NodeSlots
-from tongflow.protocol import asset_as_path
+from tongflow.protocol import asset, asset_as_path
 from tongflow.slots import current_params, node_slot
 
 
@@ -70,10 +73,16 @@ MULTI_NGRAM_WINDOW = 1024
 # Longer PDFs are parsed in page windows of this size, joined in order.
 PAGES_PER_CALL = 48
 
-# Grounding markup the model interleaves with the Markdown:
-# <|ref|>label<|/ref|><|det|>[[x1, y1, x2, y2]]<|/det|>
-_REF_DET = re.compile(r"<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>", re.DOTALL)
-_BARE_DET = re.compile(r"<\|det\|>\s*[A-Za-z_][\w-]*\s*\[[^\]]+\]\s*<\|/det\|>", re.DOTALL)
+# Grounding markup the model interleaves with the Markdown, boxes in 0..999
+# page coordinates: <|ref|>label<|/ref|><|det|>[[x1, y1, x2, y2]]<|/det|>, or
+# the bare form <|det|>label [x1, y1, x2, y2]<|/det|>.
+_GROUNDING = re.compile(
+    r"<\|ref\|>(?P<ref>.*?)<\|/ref\|><\|det\|>(?P<box>.*?)<\|/det\|>"
+    r"|<\|det\|>\s*(?P<label>[A-Za-z_][\w-]*)\s*(?P<bbox>\[[^\]]+\])\s*<\|/det\|>",
+    re.DOTALL,
+)
+FIGURE_LABEL = "image"
+FIGURE_JPEG_QUALITY = 90
 PAGE_MARKER = "<PAGE>"
 
 volume = modal.Volume.from_name("models", create_if_missing=True)
@@ -89,7 +98,7 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu126",
     )
     .pip_install(
-        "tongflow==0.3.4", "fastapi[standard]",
+        "tongflow==1.0.0", "fastapi[standard]",
         # Upstream-tested stack for the remote modeling code.
         "transformers==4.52.1",
         "tokenizers==0.21.4",
@@ -140,12 +149,60 @@ def is_pdf(path: str) -> bool:
         return False
 
 
-def clean_pages(raw: str) -> list[str]:
-    """Split raw model output on <PAGE> and drop grounding markup (as upstream's result.md)."""
+def _boxes(text: str) -> list[list[float]]:
+    """Parse a det payload (one box or a list of boxes) without eval."""
+    try:
+        v = ast.literal_eval(text.strip())
+    except (ValueError, SyntaxError):
+        return []
+    if v and isinstance(v[0], (int, float)):
+        v = [v]
+    return [list(b) for b in v if isinstance(b, (list, tuple)) and len(b) == 4]
+
+
+def crop_figure(page, box: list[float]) -> bytes | None:
+    """Crop a 0..999-normalized box out of a PIL page image as JPEG bytes."""
+    w, h = page.size
+    x1, y1, x2, y2 = (int(c / 999 * s) for c, s in zip(box, (w, h, w, h)))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    buf = io.BytesIO()
+    page.crop((x1, y1, x2, y2)).save(buf, format="JPEG", quality=FIGURE_JPEG_QUALITY)
+    return buf.getvalue()
+
+
+def split_pages(raw: str, page_paths: list[str], figures: list[Asset]) -> list[str]:
+    """Split raw model output on <PAGE> into per-page Markdown (as upstream's result.md).
+
+    Figure regions are cropped from their page image and appended to
+    ``figures``; each leaves ``![image N](#image-N)`` in the text, N being its
+    1-based position in ``figures``. Other grounding markup is dropped.
+    """
+    from PIL import Image
+
     pages = raw.split(PAGE_MARKER)[1:] if PAGE_MARKER in raw else [raw]
     out: list[str] = []
-    for page in pages:
-        page = _BARE_DET.sub("", _REF_DET.sub("", page))
+    for i, page in enumerate(pages):
+        path = page_paths[i] if i < len(page_paths) else None
+        loaded: dict[str, object] = {}
+
+        def replace(m: re.Match[str]) -> str:
+            label = (m.group("ref") or m.group("label") or "").strip()
+            if label != FIGURE_LABEL or path is None:
+                return ""
+            if "img" not in loaded:
+                loaded["img"] = Image.open(path).convert("RGB")
+            links: list[str] = []
+            for box in _boxes(m.group("box") or m.group("bbox") or ""):
+                data = crop_figure(loaded["img"], box)
+                if data is None:
+                    continue
+                n = len(figures) + 1
+                figures.append(asset(data, mime="image/jpeg", filename=f"image-{n}.jpg"))
+                links.append(f"![image {n}](#image-{n})")
+            return "\n\n".join(links)
+
+        page = _GROUNDING.sub(replace, page)
         page = page.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
         out.append(page.strip())
     return out
@@ -178,12 +235,13 @@ class Inference:
             .cuda()
         )
 
-    def _parse(self, image_paths: list[str], out_dir: str) -> str:
+    def _parse(self, image_paths: list[str], out_dir: str) -> tuple[str, list[Asset]]:
         # No prompt: the model builds its trained "<PAGE><image>" * n +
         # "Multi page parsing." layout, and crop_mode=None picks gundam tiling
         # for a single page and base mode for several.
         ngram_window = SINGLE_NGRAM_WINDOW if len(image_paths) == 1 else MULTI_NGRAM_WINDOW
         pages: list[str] = []
+        figures: list[Asset] = []
         for start in range(0, len(image_paths), PAGES_PER_CALL):
             batch = image_paths[start : start + PAGES_PER_CALL]
             raw = self.model.infer(
@@ -195,8 +253,8 @@ class Inference:
                 ngram_window=ngram_window,
                 eval_mode=True,
             )
-            pages.extend(clean_pages(raw or ""))
-        return "\n\n".join(p for p in pages if p)
+            pages.extend(split_pages(raw or "", batch, figures))
+        return "\n\n".join(p for p in pages if p), figures
 
     @modal.method()
     @node_slot(NodeSlots.PARSE_DOCUMENT)
@@ -211,8 +269,8 @@ class Inference:
                     pages = pdf_to_images(doc_path, out_dir, dpi=_adv("pdf_dpi", PDF_DPI))
                 else:
                     pages = [doc_path]
-                text = self._parse(pages, out_dir)
-            return ParseDocumentOutput(success=True, text=text)
+                text, figures = self._parse(pages, out_dir)
+            return ParseDocumentOutput(success=True, text=text, images=figures or None)
         except Exception as e:
             logger.error(f"unlimited-ocr inference error: {e}", exc_info=True)
             return ParseDocumentOutput(success=False, error=f"infer error: {e}")
